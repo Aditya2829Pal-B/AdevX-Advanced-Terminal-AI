@@ -204,3 +204,7 @@ $env:ADEVX_OLLAMA_TIMEOUT="240"
 - If Ollama is running locally, offline mode can also use a local LLM for broader reasoning.
 - File operations are restricted to the current workspace for safety.
 - Shell commands always require your approval before running.
+
+## Author
+
+Aditya Pal
