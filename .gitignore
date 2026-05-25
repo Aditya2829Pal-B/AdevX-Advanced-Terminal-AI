@@ -1,0 +1,28 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE/system
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Secrets/config
+.env
+.env.*
+
+# Local AdevX runtime state
+.adevx_memory.json
+.adevx_memory_modular.json
+.adevx_phase_progress.json
+.adevx_rag_index.json
+
