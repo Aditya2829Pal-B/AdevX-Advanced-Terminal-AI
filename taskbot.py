@@ -2186,6 +2186,11 @@ class FallbackBot:
             subject = normalize_fact_key(who_match.group(1))
             if subject in LOCAL_FACTS:
                 return LOCAL_FACTS[subject]
+            if self.local_llm is not None:
+                try:
+                    return self.local_llm.ask(raw)
+                except RuntimeError:
+                    pass
             return (
                 f"I don't have reliable offline knowledge for '{who_match.group(1).strip()}'. "
                 "Use /online for broader answers, or ask me to run local tasks."
@@ -2479,6 +2484,7 @@ class AdevXBot:
         self.rag_store = offline_bot.rag_store
         self.phase_store = PhaseProgressStore()
         self.use_online = online_bot is not None
+        self.last_online_error = ""
         self.current_mode = "chat"
         self.offline_bot.set_mode(self.current_mode)
         if self.online_bot is not None:
@@ -2502,6 +2508,9 @@ class AdevXBot:
             f"({self.rag_store._data.get('files_indexed', 0)} files, "
             f"{self.rag_store._data.get('chunks_indexed', 0)} chunks)"
         )
+        last_error_line = (
+            f"\nLast online error: {self.last_online_error}" if self.last_online_error else ""
+        )
         if self.online_bot and self.provider_configs:
             live_mode = "online" if self.use_online else "offline (manual)"
             return (
@@ -2510,6 +2519,7 @@ class AdevXBot:
                 f"{self.online_bot.status_text()}\n"
                 f"{rag_line}\n"
                 f"{self.phase_store.status_text()}\n"
+                f"{last_error_line}\n"
                 "Tip: /offline switches to local no-API mode, /online switches back."
             )
         return (
@@ -2518,6 +2528,7 @@ class AdevXBot:
             "Local engine: rule-based + optional Ollama local LLM (no cloud token billing)\n"
             f"{rag_line}\n"
             f"{self.phase_store.status_text()}\n"
+            f"{last_error_line}\n"
             "Set one of OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, TOGETHER_API_KEY, "
             "then restart AdevX for online mode."
         )
@@ -2868,6 +2879,7 @@ class AdevXBot:
                     "a local Ollama model and restart."
                 )
             self.use_online = True
+            self.last_online_error = ""
             return "Switched to online mode.\n" + self.online_bot.status_text()
 
         # Slash commands always run locally for predictable control.
@@ -2887,9 +2899,15 @@ class AdevXBot:
                     or "too many requests" in lowered
                 ):
                     self.use_online = False
-                    return self.offline_bot.ask(text)
+                    self.last_online_error = message
+                    return (
+                        "Online quota/rate limit reached. I switched to offline mode.\n"
+                        "Use /status to see provider state, then /online after credits/reset.\n\n"
+                        f"{self.offline_bot.ask(text)}"
+                    )
                 if "invalid header value" in lowered:
                     self.use_online = False
+                    self.last_online_error = message
                     return (
                         "Your API key looks malformed (often hidden newline/space). "
                         "I switched to offline mode.\n\n"
@@ -2897,17 +2915,20 @@ class AdevXBot:
                     )
                 if "timed out" in lowered and "ollama-local" in lowered:
                     self.use_online = False
+                    self.last_online_error = message
                     return (
                         "Local model timed out on this request. I switched to offline mode.\n"
                         "Try: /autotune 20, then retry your prompt."
                     )
                 if "all providers failed" in lowered:
                     self.use_online = False
+                    self.last_online_error = message
                     return (
                         "All online providers are currently unavailable. "
                         "I switched to offline mode.\n\n"
                         f"{self.offline_bot.ask(text)}"
                     )
+                self.last_online_error = message
                 return f"Online error: {message}"
 
         return self.offline_bot.ask(text)
