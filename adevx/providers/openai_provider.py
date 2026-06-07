@@ -1,34 +1,28 @@
-"""OpenAI-compatible provider adapter skeleton."""
+"""OpenAI provider adapter."""
 
 from __future__ import annotations
 
-from adevx.core.models import AssistantResponse, ChatMessage, UserRequest
-from adevx.providers.base import BaseProvider
+import os
+
+from adevx.providers.http_compat import OpenAICompatHTTPProvider
 
 
-class OpenAIProvider(BaseProvider):
-    def __init__(self, model: str = "gpt-4.1-mini") -> None:
-        self.name = "openai"
-        self.model = model
-
-    async def complete(
+class OpenAIProvider(OpenAICompatHTTPProvider):
+    def __init__(
         self,
-        *,
-        messages: list[ChatMessage],
-        request: UserRequest,
-        stream: bool = False,
-    ) -> AssistantResponse:
-        # Production implementation:
-        # 1) map messages to OpenAI format
-        # 2) call /chat/completions with retries
-        # 3) parse tool calls + response metadata
-        # Kept as scaffold to preserve compatibility with current monolith.
-        text = f"[OpenAIProvider:{self.model}] {request.text}"
-        return AssistantResponse(
-            request_id=request.request_id,
-            text=text,
-            provider=self.name,
-            mode=request.mode,
-            metadata={"scaffold": True},
+        model: str = "gpt-4.1-mini",
+        api_key: str | None = None,
+        api_base: str | None = None,
+    ) -> None:
+        resolved_key = (api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
+        resolved_base = (api_base or os.environ.get("ADEVX_OPENAI_BASE", "https://api.openai.com/v1")).strip()
+        timeout = float(os.environ.get("ADEVX_REQUEST_TIMEOUT", "45"))
+        max_tokens = int(os.environ.get("ADEVX_MAX_TOKENS", "600"))
+        super().__init__(
+            name="openai",
+            model=model,
+            api_key=resolved_key,
+            api_base=resolved_base,
+            request_timeout_s=timeout,
+            max_tokens=max_tokens,
         )
-

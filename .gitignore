@@ -25,4 +25,5 @@ Thumbs.db
 .adevx_memory_modular.json
 .adevx_phase_progress.json
 .adevx_rag_index.json
-
+.adevx_semantic_index.json
+.adevx_test_tmp/

@@ -1,29 +1,28 @@
-"""Ollama local provider adapter skeleton."""
+"""Ollama local provider adapter."""
 
 from __future__ import annotations
 
-from adevx.core.models import AssistantResponse, ChatMessage, UserRequest
-from adevx.providers.base import BaseProvider
+import os
+
+from adevx.providers.http_compat import OpenAICompatHTTPProvider
 
 
-class OllamaLocalProvider(BaseProvider):
-    def __init__(self, model: str = "qwen2.5:7b") -> None:
-        self.name = "ollama-local"
-        self.model = model
-
-    async def complete(
+class OllamaLocalProvider(OpenAICompatHTTPProvider):
+    def __init__(
         self,
-        *,
-        messages: list[ChatMessage],
-        request: UserRequest,
-        stream: bool = False,
-    ) -> AssistantResponse:
-        text = f"[OllamaLocalProvider:{self.model}] {request.text}"
-        return AssistantResponse(
-            request_id=request.request_id,
-            text=text,
-            provider=self.name,
-            mode=request.mode,
-            metadata={"scaffold": True, "local_first": True},
+        model: str = "qwen2.5:7b",
+        api_base: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        resolved_base = (api_base or os.environ.get("ADEVX_OLLAMA_BASE", "http://localhost:11434/v1")).strip()
+        resolved_key = (api_key or os.environ.get("ADEVX_OLLAMA_API_KEY", "ollama")).strip()
+        timeout = float(os.environ.get("ADEVX_OLLAMA_TIMEOUT", "180"))
+        max_tokens = int(os.environ.get("ADEVX_OLLAMA_MAX_TOKENS", "220"))
+        super().__init__(
+            name="ollama-local",
+            model=model,
+            api_key=resolved_key,
+            api_base=resolved_base,
+            request_timeout_s=timeout,
+            max_tokens=max_tokens,
         )
-

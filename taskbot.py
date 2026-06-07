@@ -1881,6 +1881,46 @@ class MultiProviderOnlineBot:
             speed = "unknown"
         return f"Active: {active}\nChain: {chain}\nModels: {models}\nSpeed: {speed}"
 
+    def health_check(self, timeout_s: float = 8.0) -> str:
+        if not self.configs:
+            return "No online providers configured."
+        lines = [f"Provider health (timeout={timeout_s:.1f}s):"]
+        ok_count = 0
+        for cfg in self.configs:
+            provider = cfg.provider
+            if provider == "ollama-local":
+                url = f"{ollama_api_root(cfg.api_base)}/api/tags"
+            else:
+                url = f"{cfg.api_base.rstrip('/')}/models"
+            headers: dict[str, str] = {}
+            if cfg.api_key:
+                headers["Authorization"] = f"Bearer {cfg.api_key.strip()}"
+            headers.update(cfg.extra_headers)
+
+            req = urllib.request.Request(url, method="GET", headers=headers)
+            started = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    latency_ms = (time.time() - started) * 1000.0
+                    lines.append(
+                        f"- {provider}: OK ({resp.status}, {latency_ms:.0f} ms, model={cfg.model})"
+                    )
+                    ok_count += 1
+            except urllib.error.HTTPError as exc:
+                latency_ms = (time.time() - started) * 1000.0
+                body = exc.read().decode("utf-8", errors="replace")
+                short = body.strip().replace("\n", " ")
+                if len(short) > 120:
+                    short = short[:120] + "..."
+                lines.append(
+                    f"- {provider}: FAIL (HTTP {exc.code}, {latency_ms:.0f} ms) {short}"
+                )
+            except Exception as exc:
+                latency_ms = (time.time() - started) * 1000.0
+                lines.append(f"- {provider}: FAIL ({latency_ms:.0f} ms) {exc}")
+        lines.append(f"Healthy providers: {ok_count}/{len(self.configs)}")
+        return "\n".join(lines)
+
     def set_mode(self, mode: str) -> str:
         normalized = normalize_mode_name(mode)
         if not normalized:
@@ -2123,6 +2163,7 @@ class FallbackBot:
     /image <path>
     /shell <command>
     /summarize <text>
+    /health [timeout_seconds]
     """
 
     def __init__(
@@ -2360,6 +2401,7 @@ class FallbackBot:
             - /fetch <url>
             - /shell <command>
             - /summarize <text>
+            - /health [timeout_seconds]
             - /about
             - /models
             - /use provider:model
@@ -2816,6 +2858,23 @@ class AdevXBot:
             if self.online_bot is None:
                 return "Online provider not active. Use /online or /use provider:model first."
             return self.online_bot.set_speed_profile(tail)
+
+        if lower.startswith("/health"):
+            timeout_s = 8.0
+            tail = text[len("/health") :].strip()
+            if tail:
+                try:
+                    timeout_s = float(tail)
+                    if timeout_s <= 0:
+                        raise ValueError("must be positive")
+                except ValueError:
+                    return "Usage: /health [timeout_seconds], e.g. /health 8"
+            if self.online_bot is None:
+                return (
+                    "Online providers are not configured. Set provider keys or Ollama first, "
+                    "then retry /health."
+                )
+            return self.online_bot.health_check(timeout_s=timeout_s)
 
         if lower.startswith("/rag"):
             tail = text[len("/rag") :].strip()

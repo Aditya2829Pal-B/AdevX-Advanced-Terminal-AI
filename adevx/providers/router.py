@@ -37,11 +37,13 @@ class ProviderRouter:
     ) -> AssistantResponse:
         self._last_outcomes = []
         errors: list[str] = []
+        attempted = 0
 
         for provider_name in self._chain:
             provider = self._providers.get(provider_name)
             if provider is None:
                 continue
+            attempted += 1
             breaker = self._circuits.for_key(provider_name)
             start = time.perf_counter()
             try:
@@ -79,5 +81,10 @@ class ProviderRouter:
                     )
                 )
 
+        if attempted == 0:
+            raise ProviderError(
+                "No providers are configured for the active chain. "
+                "Set provider API keys (OPENAI_API_KEY / OPENROUTER_API_KEY / GROQ_API_KEY / "
+                "TOGETHER_API_KEY) or enable local Ollama (ADEVX_ENABLE_OLLAMA=1)."
+            )
         raise ProviderError("All providers failed.\n" + "\n".join(f"- {err}" for err in errors))
-

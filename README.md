@@ -15,6 +15,8 @@ It includes:
 - Offline local minimal-reasoning mode (no API key required)
 - Automatic provider failover chain (smart routing + fallback)
 - Phase 2 RAG: project indexing + retrieval context injection
+- Modular runtime RAG: incremental semantic indexing + hybrid retrieval
+  (BM25 lexical + sparse semantic similarity + symbol boosts)
 - Built-in tools for:
   - file listing/reading/writing/appending/searching
   - safe math calculation
@@ -34,6 +36,10 @@ Modular architecture preview runtime:
 ```powershell
 python -m adevx.main
 ```
+
+The modular runtime now uses live provider calls (OpenAI-compatible HTTP APIs)
+instead of scaffold echo responses, with retry + circuit-breaker routing.
+It also runs background incremental index refresh for workspace retrieval quality.
 
 Autonomous reasoning docs:
 
@@ -111,6 +117,7 @@ Slash commands always work (even while online):
 - `/use provider:model`
 - `/autotune [max_latency_seconds]`
 - `/speed fast|balanced|quality`
+- `/health [timeout_seconds]`
 - `/modes`
 - `/mode <name>`
 - `/image <path>`
@@ -194,6 +201,14 @@ For slow local models, increase local timeout:
 
 ```powershell
 $env:ADEVX_OLLAMA_TIMEOUT="240"
+```
+
+## Tests
+
+Run core regression tests:
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ## Notes

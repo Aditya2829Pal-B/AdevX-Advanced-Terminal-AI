@@ -103,7 +103,8 @@ docs/
 4. Local-first reliability:
    memory and RAG persist locally by default.
 5. Compatibility-first migration:
-   current `taskbot` tool and RAG implementations are wrapped, not discarded.
+   current `taskbot` tool implementations are wrapped during transition,
+   while modular RAG now uses native incremental semantic indexing.
 
 ## 4. Dependency Graph
 
@@ -354,8 +355,9 @@ Core event types already used:
 ### Phase 0: Compatibility Baseline
 
 1. Keep `taskbot.py` as production path.
-2. Wrap existing tool and RAG functions from modular adapters.
-3. Validate zero regression in slash commands.
+2. Wrap existing tool functions from modular adapters.
+3. Keep modular/runtime RAG local-first and independently evolvable.
+4. Validate zero regression in slash commands.
 
 ### Phase 1: Runtime Side-by-Side
 
@@ -367,6 +369,8 @@ Core event types already used:
 ### Phase 2: Provider Adapter Migration
 
 1. Replace scaffold provider responses with real API clients.
+   Status: Completed for OpenAI-compatible chat-completions path
+   (OpenAI/OpenRouter/Groq/Together/Ollama via `providers/http_compat.py`).
 2. Add full tool-calling translation in provider adapters.
 3. Maintain fallback parity with existing chain behavior.
 
@@ -421,4 +425,3 @@ Core event types already used:
 3. Add streaming event types and GUI-ready event consumers.
 4. Add persistent agent/session store.
 5. Add policy-driven permission model for plugin and tool scopes.
-

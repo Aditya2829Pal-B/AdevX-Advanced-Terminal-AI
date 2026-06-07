@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from pathlib import Path
 
 from adevx.agents.collaboration import CollaborationManager
@@ -29,6 +31,7 @@ from adevx.memory.json_store import JsonMemoryStore
 from adevx.memory.working import LongTermRetriever, ScratchpadMemory, WorkingMemory
 from adevx.planning.goal_decomposer import GoalDecomposer
 from adevx.plugins.registry import PluginRegistry
+from adevx.providers.base import BaseProvider
 from adevx.providers.compat_provider import OpenAICompatProvider
 from adevx.providers.ollama_provider import OllamaLocalProvider
 from adevx.providers.openai_provider import OpenAIProvider
@@ -45,6 +48,88 @@ from adevx.tools.builtin_tools import build_default_tools
 from adevx.tools.registry import ToolRegistry
 from adevx.planning.planner import HeuristicPlanner
 from adevx.planning.tot_planner import TreeOfThoughtPlanner
+
+
+def _clean_env_secret(value: str | None) -> str:
+    if value is None:
+        return ""
+    return value.strip()
+
+
+def _flag_enabled(name: str, default: str = "1") -> bool:
+    raw = os.environ.get(name, default).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _pick_model(default_model: str, specific_env: str) -> str:
+    return (
+        os.environ.get(specific_env, "").strip()
+        or os.environ.get("ADEVX_MODEL", "").strip()
+        or default_model
+    )
+
+
+def _build_provider_map(logger: StructuredLogger) -> dict[str, BaseProvider]:
+    providers: dict[str, BaseProvider] = {}
+
+    openai_key = _clean_env_secret(os.environ.get("OPENAI_API_KEY"))
+    if openai_key:
+        providers["openai"] = OpenAIProvider(
+            model=_pick_model("gpt-4.1-mini", "ADEVX_OPENAI_MODEL"),
+            api_key=openai_key,
+            api_base=os.environ.get("ADEVX_OPENAI_BASE", "").strip() or None,
+        )
+    else:
+        logger.info("provider.disabled", provider="openai", reason="missing OPENAI_API_KEY")
+
+    openrouter_key = _clean_env_secret(os.environ.get("OPENROUTER_API_KEY"))
+    if openrouter_key:
+        providers["openrouter"] = OpenAICompatProvider(
+            "openrouter",
+            model=_pick_model("openrouter/free", "ADEVX_OPENROUTER_MODEL"),
+            api_key=openrouter_key,
+            api_base=os.environ.get("ADEVX_OPENROUTER_BASE", "").strip() or None,
+        )
+    else:
+        logger.info("provider.disabled", provider="openrouter", reason="missing OPENROUTER_API_KEY")
+
+    groq_key = _clean_env_secret(os.environ.get("GROQ_API_KEY"))
+    if groq_key:
+        providers["groq"] = OpenAICompatProvider(
+            "groq",
+            model=_pick_model("openai/gpt-oss-20b", "ADEVX_GROQ_MODEL"),
+            api_key=groq_key,
+            api_base=os.environ.get("ADEVX_GROQ_BASE", "").strip() or None,
+        )
+    else:
+        logger.info("provider.disabled", provider="groq", reason="missing GROQ_API_KEY")
+
+    together_key = _clean_env_secret(os.environ.get("TOGETHER_API_KEY"))
+    if together_key:
+        providers["together"] = OpenAICompatProvider(
+            "together",
+            model=_pick_model("openai/gpt-oss-20b", "ADEVX_TOGETHER_MODEL"),
+            api_key=together_key,
+            api_base=os.environ.get("ADEVX_TOGETHER_BASE", "").strip() or None,
+        )
+    else:
+        logger.info("provider.disabled", provider="together", reason="missing TOGETHER_API_KEY")
+
+    if _flag_enabled("ADEVX_ENABLE_OLLAMA", "1"):
+        providers["ollama-local"] = OllamaLocalProvider(
+            model=_pick_model("qwen2.5:7b", "ADEVX_OLLAMA_MODEL"),
+            api_base=os.environ.get("ADEVX_OLLAMA_BASE", "").strip() or None,
+            api_key=os.environ.get("ADEVX_OLLAMA_API_KEY", "").strip() or None,
+        )
+    else:
+        logger.info("provider.disabled", provider="ollama-local", reason="ADEVX_ENABLE_OLLAMA=0")
+
+    logger.info(
+        "providers.initialized",
+        total=len(providers),
+        names=",".join(sorted(providers.keys())),
+    )
+    return providers
 
 
 def build_runtime_context(config: RuntimeConfig) -> tuple[RuntimeContext, BackgroundWorkerSupervisor, PluginRegistry]:
@@ -66,7 +151,7 @@ def build_runtime_context(config: RuntimeConfig) -> tuple[RuntimeContext, Backgr
     scratchpad = ScratchpadMemory(max_entries=500)
     working_memory = WorkingMemory(max_items=180)
     long_term = LongTermRetriever(memory)
-    rag_index = WorkspaceIndexAdapter()
+    rag_index = WorkspaceIndexAdapter(workspace_root=Path(config.workspace_root))
     retriever = WorkspaceRetriever(rag_index)
 
     tool_registry = ToolRegistry()
@@ -74,13 +159,7 @@ def build_runtime_context(config: RuntimeConfig) -> tuple[RuntimeContext, Backgr
     for tool in build_default_tools(guard):
         tool_registry.register(tool)
 
-    providers = {
-        "openai": OpenAIProvider(model="gpt-4.1-mini"),
-        "groq": OpenAICompatProvider("groq", model="openai/gpt-oss-20b"),
-        "openrouter": OpenAICompatProvider("openrouter", model="openrouter/free"),
-        "together": OpenAICompatProvider("together", model="openai/gpt-oss-20b"),
-        "ollama-local": OllamaLocalProvider(model="qwen2.5:7b"),
-    }
+    providers = _build_provider_map(logger)
     provider_router = ProviderRouter(
         providers=providers,
         chain=list(config.provider_chain),
@@ -159,6 +238,18 @@ def build_runtime_context(config: RuntimeConfig) -> tuple[RuntimeContext, Backgr
     )
 
     supervisor = BackgroundWorkerSupervisor()
+    refresh_every_s = max(5.0, float(os.environ.get("ADEVX_RAG_BACKGROUND_REFRESH_S", "30")))
+
+    async def _rag_refresh_worker() -> None:
+        while True:
+            await asyncio.sleep(refresh_every_s)
+            try:
+                result = await rag_index.refresh()
+                logger.debug("rag.refresh", result=result)
+            except Exception as exc:
+                logger.warning("rag.refresh.failed", error=str(exc))
+
+    supervisor.register("rag-refresh", _rag_refresh_worker)
     plugin_registry = PluginRegistry()
 
     ctx = RuntimeContext(
