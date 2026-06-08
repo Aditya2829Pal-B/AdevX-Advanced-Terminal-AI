@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from adevx.agents.manager import AgentStateManager
 from adevx.core.capability_registry import InMemoryCapabilityRegistry
@@ -20,3 +21,16 @@ class RuntimeContext:
     agent_manager: AgentStateManager
     capabilities: InMemoryCapabilityRegistry
     orchestrator: ExecutionOrchestrator
+    planner_agent: Any | None = None
+    research_agent: Any | None = None
+    executor_agent: Any | None = None
+    reviewer_agent: Any | None = None
+    memory_agent: Any | None = None
+    autonomous_engine: Any | None = None
+    provider_router: Any | None = None
+    tool_registry: Any | None = None
+    memory_store: Any | None = None
+    working_memory: Any | None = None
+    retriever: Any | None = None
+    rag_index: Any | None = None
+    metrics: Any | None = None

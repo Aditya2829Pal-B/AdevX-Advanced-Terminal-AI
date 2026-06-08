@@ -17,6 +17,11 @@ It includes:
 - Phase 2 RAG: project indexing + retrieval context injection
 - Modular runtime RAG: incremental semantic indexing + hybrid retrieval
   (BM25 lexical + sparse semantic similarity + symbol boosts)
+- Repository intelligence: AST-aware symbols, imports, call graph, and references
+- Agent commands: planning, execution, and review from the terminal
+- Git intelligence: repository analysis, commit summaries, and impact reports
+- Memory architecture: stats, search, and consolidation over local memory
+- Local benchmark + metrics commands for retrieval and command health
 - Built-in tools for:
   - file listing/reading/writing/appending/searching
   - safe math calculation
@@ -111,6 +116,7 @@ Slash commands always work (even while online):
 - `/help`
 - `/remember <note>`
 - `/memory`
+- `/memory stats|search <query>|consolidate`
 - `/forget`
 - `/about`
 - `/models`
@@ -122,6 +128,11 @@ Slash commands always work (even while online):
 - `/mode <name>`
 - `/image <path>`
 - `/rag status|rebuild|query <text>|on|off`
+- `/repo symbols|graph|explain <symbol>|references <symbol>`
+- `/agent plan|execute|review <text>`
+- `/git analyze|summarize [rev]|impact [path|rev-range]`
+- `/benchmark`
+- `/metrics`
 - `/phase run|status`
 - `/status`
 - `/online`
@@ -162,6 +173,10 @@ Model switch examples:
 - `/image assets/logo.png`
 - `/rag rebuild`
 - `/rag query merge sort implementation`
+- `/repo explain WorkspaceIndexAdapter`
+- `/memory search provider routing`
+- `/agent plan implement auth middleware`
+- `/git analyze`
 - `/phase run`
 
 Phase automation:

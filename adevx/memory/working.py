@@ -115,6 +115,9 @@ class LongTermRetriever:
         self.store = store
 
     async def retrieve(self, session_id: str, query: str, limit: int = 10) -> list[str]:
+        records = await self.store.search(query=query, session_id=session_id, limit=max(limit, 20))
+        if records:
+            return [record.text for record in records[:limit]]
         notes = await self.store.get_recent(session_id, limit=200)
         if not notes:
             return []
@@ -133,4 +136,3 @@ class LongTermRetriever:
 
 def _terms(text: str) -> list[str]:
     return re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{1,}", text.lower())
-

@@ -163,3 +163,40 @@ class CodingAgent:
     async def solve(self, request: UserRequest, task: DecomposedTask, research_context: dict[str, str]) -> tuple[str, float]:
         return await self.executor.execute_task(request, task, research_context)
 
+
+@dataclass(slots=True)
+class MemoryAgent:
+    long_term: LongTermRetriever
+    working_memory: WorkingMemory
+
+    async def search(self, session_id: str, query: str, limit: int = 10) -> list[str]:
+        results = await self.long_term.retrieve(session_id=session_id, query=query, limit=limit)
+        if results:
+            return results
+        working = self.working_memory.prioritize(query, limit=limit)
+        return [item.value for item in working]
+
+    async def consolidate(self, session_id: str) -> str:
+        store = self.long_term.store
+        if not hasattr(store, "consolidate"):
+            return "Memory consolidation is unavailable."
+        result = await store.consolidate(session_id)
+        summary = str(result.get("summary", "")).strip()
+        collapsed = int(result.get("collapsed", 0) or 0)
+        if summary:
+            self.working_memory.put(
+                key=f"summary_{session_id}",
+                value=summary,
+                weight=1.6,
+                metadata={"kind": "summary"},
+            )
+            return f"Consolidated {collapsed} records.\n{summary}"
+        return f"Consolidated {collapsed} records."
+
+
+class ExecutionAgent(ExecutorAgent):
+    """Backward-compatible alias matching the public architecture naming."""
+
+
+class ReviewAgent(ReviewerAgent):
+    """Backward-compatible alias matching the public architecture naming."""

@@ -15,6 +15,7 @@ This bot is intentionally transparent and extensible. It cannot literally do
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ast
 import hashlib
 import json
@@ -32,6 +33,10 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+from adevx.core.git_intelligence import GitIntelligence
+from adevx.rag.index import WorkspaceIndexAdapter
+from adevx.telemetry.benchmarks import BenchmarkRunner
 
 
 WORKSPACE_ROOT = Path.cwd().resolve()
@@ -259,10 +264,19 @@ def model_aliases(model_name: str) -> set[str]:
     return aliases
 
 
+def run_async(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
 class MemoryStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or (WORKSPACE_ROOT / ".adevx_memory.json")
-        self._data: dict[str, Any] = {"notes": []}
+        self._data: dict[str, Any] = {
+            "notes": [],
+            "records": [],
+            "project_memory": {},
+            "summaries": [],
+        }
         self._load()
 
     def _load(self) -> None:
@@ -275,8 +289,37 @@ class MemoryStore:
                 if isinstance(notes, list):
                     clean_notes = [str(x).strip() for x in notes if str(x).strip()]
                     self._data["notes"] = clean_notes[:200]
+                records = raw.get("records", [])
+                if isinstance(records, list):
+                    clean_records: list[dict[str, Any]] = []
+                    for item in records:
+                        if not isinstance(item, dict):
+                            continue
+                        text = str(item.get("text", "")).strip()
+                        if not text:
+                            continue
+                        clean_records.append(
+                            {
+                                "text": text,
+                                "kind": str(item.get("kind", "conversation")),
+                                "created_at": str(item.get("created_at", "")) or time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "metadata": dict(item.get("metadata", {})) if isinstance(item.get("metadata"), dict) else {},
+                            }
+                        )
+                    self._data["records"] = clean_records[-500:]
+                project_memory = raw.get("project_memory", {})
+                if isinstance(project_memory, dict):
+                    clean_projects: dict[str, list[str]] = {}
+                    for key, values in project_memory.items():
+                        if not isinstance(values, list):
+                            continue
+                        clean_projects[str(key)] = [str(x).strip() for x in values if str(x).strip()][-120:]
+                    self._data["project_memory"] = clean_projects
+                summaries = raw.get("summaries", [])
+                if isinstance(summaries, list):
+                    self._data["summaries"] = [str(x).strip() for x in summaries if str(x).strip()][-50:]
         except Exception:
-            self._data = {"notes": []}
+            self._data = {"notes": [], "records": [], "project_memory": {}, "summaries": []}
 
     def _save(self) -> None:
         self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
@@ -291,10 +334,51 @@ class MemoryStore:
             # Keep bounded memory.
             if len(notes) > 200:
                 del notes[0 : len(notes) - 200]
+        self.add_record(
+            note,
+            kind="semantic",
+            metadata={"source": "remember", "project": WORKSPACE_ROOT.name},
+            save=False,
+        )
+        self._save()
+
+    def add_record(
+        self,
+        text: str,
+        *,
+        kind: str = "conversation",
+        metadata: dict[str, Any] | None = None,
+        save: bool = True,
+    ) -> None:
+        value = text.strip()
+        if not value:
+            return
+        records = self._data.setdefault("records", [])
+        records.append(
+            {
+                "text": value,
+                "kind": kind.strip().lower() or "conversation",
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "metadata": {
+                    "project": WORKSPACE_ROOT.name,
+                    **(metadata or {}),
+                },
+            }
+        )
+        if len(records) > 500:
+            del records[0 : len(records) - 500]
+        project = str((metadata or {}).get("project", WORKSPACE_ROOT.name)).strip()
+        if project:
+            project_memory = self._data.setdefault("project_memory", {}).setdefault(project, [])
+            if value not in project_memory:
+                project_memory.append(value)
+                if len(project_memory) > 120:
+                    del project_memory[0 : len(project_memory) - 120]
+        if save:
             self._save()
 
     def clear(self) -> None:
-        self._data = {"notes": []}
+        self._data = {"notes": [], "records": [], "project_memory": {}, "summaries": []}
         self._save()
 
     def notes(self, limit: int = 20) -> list[str]:
@@ -311,6 +395,112 @@ class MemoryStore:
         for note in notes:
             lines.append(f"- {note}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _terms(text: str) -> list[str]:
+        return re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{1,}", text.lower())
+
+    def search_records(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        question = query.strip()
+        if not question:
+            return []
+        q_terms = set(self._terms(question))
+        if not q_terms:
+            return []
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for record in self._data.get("records", []):
+            if not isinstance(record, dict):
+                continue
+            text = str(record.get("text", ""))
+            terms = set(self._terms(text))
+            overlap = len(q_terms & terms)
+            if overlap <= 0:
+                continue
+            kind = str(record.get("kind", "conversation"))
+            kind_boost = {
+                "semantic": 0.25,
+                "project": 0.2,
+                "episodic": 0.14,
+                "summary": 0.12,
+                "conversation": 0.08,
+            }.get(kind, 0.05)
+            score = overlap / max(1, len(q_terms)) + kind_boost
+            scored.append((score, record))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [record for _, record in scored[: max(1, limit)]]
+
+    def stats_text(self) -> str:
+        records = self._data.get("records", [])
+        if not isinstance(records, list):
+            records = []
+        kind_counts: dict[str, int] = {}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            kind = str(record.get("kind", "conversation"))
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        project_counts = {
+            key: len(values)
+            for key, values in self._data.get("project_memory", {}).items()
+            if isinstance(values, list)
+        }
+        lines = ["Memory stats:"]
+        lines.append(f"- notes: {len(self._data.get('notes', []))}")
+        lines.append(f"- records: {len(records)}")
+        lines.append(f"- summaries: {len(self._data.get('summaries', []))}")
+        if kind_counts:
+            lines.append("- kinds: " + ", ".join(f"{key}={value}" for key, value in sorted(kind_counts.items())))
+        if project_counts:
+            lines.append("- project memory: " + ", ".join(f"{key}={value}" for key, value in sorted(project_counts.items())))
+        return "\n".join(lines)
+
+    def search_text(self, query: str) -> str:
+        hits = self.search_records(query, limit=10)
+        if not hits:
+            return f"No memory matched '{query}'."
+        lines = [f"Memory search for '{query}':"]
+        for record in hits:
+            lines.append(f"- [{record.get('kind', 'conversation')}] {record.get('text', '')}")
+        return "\n".join(lines)
+
+    def consolidate_text(self, keep_recent: int = 80) -> str:
+        records = list(self._data.get("records", []))
+        if not records:
+            return "Memory is empty."
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for record in reversed(records):
+            if not isinstance(record, dict):
+                continue
+            text = str(record.get("text", "")).strip()
+            key = text.lower()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(record)
+        deduped.reverse()
+
+        collapsed = max(0, len(deduped) - keep_recent)
+        older = deduped[:collapsed]
+        recent = deduped[collapsed:]
+        if not older:
+            return "Memory is already compact."
+
+        counter: dict[str, int] = {}
+        for record in older:
+            for term in self._terms(str(record.get("text", ""))):
+                if len(term) < 4:
+                    continue
+                counter[term] = counter.get(term, 0) + 1
+        topics = [term for term, _count in sorted(counter.items(), key=lambda item: item[1], reverse=True)[:8]]
+        summary = "Memory consolidation: " + ", ".join(topics) if topics else "Memory consolidation summary"
+        self._data.setdefault("summaries", []).append(summary)
+        self.add_record(summary, kind="summary", metadata={"source": "consolidate"}, save=False)
+        self._data["records"] = recent[-500:]
+        if len(self._data["summaries"]) > 50:
+            del self._data["summaries"][0 : len(self._data["summaries"]) - 50]
+        self._save()
+        return f"Consolidated {len(older)} records.\n{summary}"
 
 
 class ProjectRAGStore:
@@ -407,6 +597,7 @@ class ProjectRAGStore:
         }
         self._skip_dirs = {
             ".git",
+            ".adevx_test_tmp",
             "__pycache__",
             "node_modules",
             ".venv",
@@ -451,10 +642,11 @@ class ProjectRAGStore:
 
     def _iter_files(self) -> list[Path]:
         files: list[Path] = []
+        root_parts = set(WORKSPACE_ROOT.parts)
         for path in WORKSPACE_ROOT.rglob("*"):
             if not path.is_file():
                 continue
-            if any(part in self._skip_dirs for part in path.parts):
+            if any(part in self._skip_dirs and part not in root_parts for part in path.parts):
                 continue
             if path.name.startswith(".adevx_"):
                 continue
@@ -2175,6 +2367,7 @@ class FallbackBot:
         self.tools = tools
         self.memory_store = memory_store or MemoryStore()
         self.rag_store = rag_store or ProjectRAGStore()
+        self.repo_index = WorkspaceIndexAdapter(workspace_root=WORKSPACE_ROOT)
         self.current_mode = "chat"
         local_configs = _resolve_provider_configs(provider_override="ollama-local")
         self.local_llm: OnlineChatClient | None = None
@@ -2391,6 +2584,7 @@ class FallbackBot:
             - /h
             - /remember <note>
             - /memory
+            - /memory stats|search <query>|consolidate
             - /forget
             - /ls [path]
             - /read <path>
@@ -2411,6 +2605,11 @@ class FallbackBot:
             - /mode <name>
             - /image <path>
             - /rag status|rebuild|query <text>|on|off
+            - /repo symbols|graph|explain <symbol>|references <symbol>
+            - /agent plan|execute|review <text>
+            - /git analyze|summarize [rev]|impact [path|rev-range]
+            - /benchmark
+            - /metrics
             - /phase run|status
             - /status
             - /online
@@ -2528,6 +2727,12 @@ class AdevXBot:
         self.use_online = online_bot is not None
         self.last_online_error = ""
         self.current_mode = "chat"
+        self.command_metrics: dict[str, Any] = {
+            "commands": {},
+            "errors": 0,
+            "latency_ms": {},
+        }
+        self.git_intel = GitIntelligence(WORKSPACE_ROOT)
         self.offline_bot.set_mode(self.current_mode)
         if self.online_bot is not None:
             self.online_bot.set_mode(self.current_mode)
@@ -2740,6 +2945,188 @@ class AdevXBot:
         lines.append("Use /phase status for latest progress.")
         return "\n".join(lines)
 
+    def _record_command_metric(self, name: str, started_at: float, ok: bool = True) -> None:
+        elapsed_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
+        commands = self.command_metrics.setdefault("commands", {})
+        commands[name] = int(commands.get(name, 0)) + 1
+        latency = self.command_metrics.setdefault("latency_ms", {}).setdefault(name, [])
+        if isinstance(latency, list):
+            latency.append(round(elapsed_ms, 2))
+            if len(latency) > 40:
+                del latency[0 : len(latency) - 40]
+        if not ok:
+            self.command_metrics["errors"] = int(self.command_metrics.get("errors", 0)) + 1
+
+    def _run_tracked_command(self, name: str, action: Callable[[], str]) -> str:
+        started_at = time.perf_counter()
+        try:
+            result = action()
+        except Exception as exc:
+            self._record_command_metric(name, started_at, ok=False)
+            return f"{name} command failed: {exc}"
+        self._record_command_metric(name, started_at, ok=True)
+        return result
+
+    def _handle_memory_command(self, tail: str) -> str:
+        sub = tail.strip()
+        if not sub:
+            notes = self.offline_bot.memory_store.notes(limit=30)
+            if not notes:
+                return "Memory is empty."
+            return "Memory:\n" + "\n".join(f"- {note}" for note in notes)
+        lowered = sub.lower()
+        if lowered == "stats":
+            return self.offline_bot.memory_store.stats_text()
+        if lowered == "consolidate":
+            return self.offline_bot.memory_store.consolidate_text()
+        if lowered.startswith("search "):
+            query = sub[7:].strip()
+            if not query:
+                return "Usage: /memory search <query>"
+            return self.offline_bot.memory_store.search_text(query)
+        return "Usage: /memory | /memory stats | /memory search <query> | /memory consolidate"
+
+    def _handle_repo_command(self, tail: str) -> str:
+        sub = tail.strip()
+        if not sub:
+            return "Usage: /repo symbols|graph|explain <symbol>|references <symbol>"
+        if sub.lower() == "symbols":
+            return run_async(self.offline_bot.repo_index.repo_symbols_text())
+        if sub.lower().startswith("symbols "):
+            search = sub[8:].strip()
+            return run_async(self.offline_bot.repo_index.repo_symbols_text(search=search))
+        if sub.lower() == "graph":
+            return run_async(self.offline_bot.repo_index.repo_graph_text())
+        if sub.lower().startswith("graph "):
+            focus = sub[6:].strip()
+            return run_async(self.offline_bot.repo_index.repo_graph_text(focus=focus))
+        if sub.lower().startswith("explain "):
+            symbol = sub[8:].strip()
+            if not symbol:
+                return "Usage: /repo explain <symbol>"
+            return run_async(self.offline_bot.repo_index.repo_explain_text(symbol))
+        if sub.lower().startswith("references "):
+            symbol = sub[11:].strip()
+            if not symbol:
+                return "Usage: /repo references <symbol>"
+            return run_async(self.offline_bot.repo_index.repo_references_text(symbol))
+        return "Usage: /repo symbols|graph|explain <symbol>|references <symbol>"
+
+    def _build_runtime(self) -> Any:
+        from adevx.core.config import RuntimeConfig
+        from adevx.runtime.app import AdevXRuntime
+
+        config = RuntimeConfig.from_env()
+        if not os.environ.get("ADEVX_LOG_LEVEL"):
+            config.log_level = "ERROR"
+        return AdevXRuntime.create(config=config)
+
+    def _handle_agent_command(self, tail: str) -> str:
+        sub = tail.strip()
+        if not sub:
+            return "Usage: /agent plan <goal> | /agent execute <goal> | /agent review <text>"
+        if sub.lower().startswith("plan "):
+            from adevx.core.models import UserRequest
+
+            goal = sub[5:].strip()
+            if not goal:
+                return "Usage: /agent plan <goal>"
+            runtime = self._build_runtime()
+            request = UserRequest(text=goal, mode=self.current_mode, session_id="cli-agent")
+            plan = run_async(runtime.context.planner_agent.plan(request))
+            lines = ["Agent plan:"]
+            lines.append(f"- goal: {plan.goal.objective}")
+            lines.append(f"- selected strategy: {plan.selected_plan.candidate.strategy}")
+            lines.append(f"- confidence: {plan.selected_plan.candidate.confidence:.2f}")
+            lines.append("Tasks:")
+            for task in plan.selected_plan.candidate.tasks:
+                deps = ", ".join(task.depends_on) if task.depends_on else "<none>"
+                lines.append(f"- {task.task_id}: {task.title} [{task.capability}] deps={deps}")
+            if plan.thought_trace.strip():
+                lines.append("Reasoning:")
+                lines.append(plan.thought_trace)
+            return "\n".join(lines)
+        if sub.lower().startswith("execute "):
+            from adevx.core.models import UserRequest
+
+            goal = sub[8:].strip()
+            if not goal:
+                return "Usage: /agent execute <goal>"
+            runtime = self._build_runtime()
+            request = UserRequest(text=goal, mode=self.current_mode, session_id="cli-agent")
+            response = run_async(runtime.context.autonomous_engine.run(request))
+            return response.text
+        if sub.lower().startswith("review "):
+            text = sub[7:].strip()
+            if not text:
+                return "Usage: /agent review <text>"
+            runtime = self._build_runtime()
+            verdict = run_async(runtime.context.reviewer_agent.critique(text))
+            memory_hint = run_async(runtime.context.memory_agent.search("cli-agent", text, limit=3))
+            lines = [f"Agent review: {verdict}"]
+            if memory_hint:
+                lines.append("Related memory:")
+                for item in memory_hint:
+                    lines.append(f"- {item}")
+            return "\n".join(lines)
+        return "Usage: /agent plan <goal> | /agent execute <goal> | /agent review <text>"
+
+    def _handle_git_command(self, tail: str) -> str:
+        sub = tail.strip()
+        if not sub:
+            return "Usage: /git analyze|summarize [rev]|impact [path|rev-range]"
+        if sub.lower() == "analyze":
+            return self.git_intel.analyze()
+        if sub.lower().startswith("analyze "):
+            return self.git_intel.analyze(sub[8:].strip())
+        if sub.lower() == "summarize":
+            return self.git_intel.summarize("HEAD")
+        if sub.lower().startswith("summarize "):
+            return self.git_intel.summarize(sub[10:].strip())
+        if sub.lower() == "impact":
+            snapshot = run_async(self.offline_bot.repo_index.repo_snapshot())
+            return self.git_intel.impact(repo_snapshot=snapshot)
+        if sub.lower().startswith("impact "):
+            snapshot = run_async(self.offline_bot.repo_index.repo_snapshot())
+            return self.git_intel.impact(sub[7:].strip(), repo_snapshot=snapshot)
+        return "Usage: /git analyze|summarize [rev]|impact [path|rev-range]"
+
+    def _handle_benchmark_command(self) -> str:
+        retrieval = run_async(BenchmarkRunner(self.offline_bot.repo_index).run_retrieval())
+        lines = [BenchmarkRunner.format_report(retrieval)]
+        if self.online_bot is not None:
+            lines.append("")
+            lines.append("Provider health:")
+            lines.append(self.online_bot.health_check(timeout_s=6.0))
+            capability = self._run_capability_benchmark()
+            lines.append("")
+            lines.append(
+                f"Capability benchmark: {capability['score']}/100 ({capability['level']})"
+            )
+            for detail in capability.get("details", []):
+                lines.append(f"- {detail}")
+        else:
+            lines.append("")
+            lines.append("Provider health: online providers are not configured.")
+        return "\n".join(lines)
+
+    def _handle_metrics_command(self) -> str:
+        lines = ["AdevX command metrics:"]
+        lines.append(f"- errors: {int(self.command_metrics.get('errors', 0))}")
+        commands = self.command_metrics.get("commands", {})
+        latency = self.command_metrics.get("latency_ms", {})
+        if not isinstance(commands, dict) or not commands:
+            lines.append("- commands: <none recorded>")
+            return "\n".join(lines)
+        for name in sorted(commands.keys()):
+            count = int(commands.get(name, 0))
+            samples = latency.get(name, []) if isinstance(latency, dict) else []
+            avg_ms = 0.0
+            if isinstance(samples, list) and samples:
+                avg_ms = sum(float(item) for item in samples) / len(samples)
+            lines.append(f"- {name}: count={count}, avg_latency_ms={avg_ms:.2f}")
+        return "\n".join(lines)
+
     def ask(self, user_text: str) -> str:
         text = user_text.strip()
         lower = text.lower()
@@ -2761,6 +3148,28 @@ class AdevXBot:
             return DEVELOPER_CREDIT
         if self._is_identity_query(lower) or self._is_identity_query(no_slash_lower):
             return ABOUT_TEXT
+
+        if lower == "/memory" or lower.startswith("/memory "):
+            tail = text[len("/memory") :].strip()
+            return self._run_tracked_command("memory", lambda: self._handle_memory_command(tail))
+
+        if lower.startswith("/repo"):
+            tail = text[len("/repo") :].strip()
+            return self._run_tracked_command("repo", lambda: self._handle_repo_command(tail))
+
+        if lower.startswith("/agent"):
+            tail = text[len("/agent") :].strip()
+            return self._run_tracked_command("agent", lambda: self._handle_agent_command(tail))
+
+        if lower.startswith("/git"):
+            tail = text[len("/git") :].strip()
+            return self._run_tracked_command("git", lambda: self._handle_git_command(tail))
+
+        if lower == "/benchmark":
+            return self._run_tracked_command("benchmark", self._handle_benchmark_command)
+
+        if lower == "/metrics":
+            return self._run_tracked_command("metrics", self._handle_metrics_command)
 
         if lower == "/modes":
             return modes_text()

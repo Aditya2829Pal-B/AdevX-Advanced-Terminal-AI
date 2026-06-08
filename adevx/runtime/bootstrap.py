@@ -8,7 +8,14 @@ from pathlib import Path
 
 from adevx.agents.collaboration import CollaborationManager
 from adevx.agents.manager import AgentStateManager
-from adevx.agents.roles import CodingAgent, ExecutorAgent, PlannerAgent, ResearchAgent, ReviewerAgent
+from adevx.agents.roles import (
+    CodingAgent,
+    ExecutionAgent,
+    MemoryAgent,
+    PlannerAgent,
+    ResearchAgent,
+    ReviewAgent,
+)
 from adevx.core.capability_registry import InMemoryCapabilityRegistry
 from adevx.core.config import RuntimeConfig
 from adevx.execution.capabilities import (
@@ -184,14 +191,15 @@ def build_runtime_context(config: RuntimeConfig) -> tuple[RuntimeContext, Backgr
         long_term=long_term,
         working_memory=working_memory,
     )
-    executor_agent = ExecutorAgent(
+    executor_agent = ExecutionAgent(
         provider_router=provider_router,
         tool_registry=tool_registry,
         selector=ToolSelectionEngine(),
         scratchpad=scratchpad,
         working_memory=working_memory,
     )
-    reviewer_agent = ReviewerAgent()
+    reviewer_agent = ReviewAgent()
+    memory_agent = MemoryAgent(long_term=long_term, working_memory=working_memory)
     coding_agent = CodingAgent(executor=executor_agent)
     collaboration = CollaborationManager(
         planner=planner_agent,
@@ -259,5 +267,18 @@ def build_runtime_context(config: RuntimeConfig) -> tuple[RuntimeContext, Backgr
         agent_manager=agent_manager,
         capabilities=capabilities,
         orchestrator=orchestrator,
+        planner_agent=planner_agent,
+        research_agent=research_agent,
+        executor_agent=executor_agent,
+        reviewer_agent=reviewer_agent,
+        memory_agent=memory_agent,
+        autonomous_engine=autonomous_engine,
+        provider_router=provider_router,
+        tool_registry=tool_registry,
+        memory_store=memory,
+        working_memory=working_memory,
+        retriever=retriever,
+        rag_index=rag_index,
+        metrics=metrics,
     )
     return ctx, supervisor, plugin_registry
