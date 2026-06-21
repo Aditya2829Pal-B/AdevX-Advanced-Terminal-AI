@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from adevx.core.errors import ProviderError
 from adevx.core.models import AssistantResponse, ChatMessage, ToolInvocation, UserRequest
+from adevx.core.redaction import redact_secrets
 from adevx.execution.autonomous_engine import AutonomousReasoningEngine
 from adevx.memory.json_store import JsonMemoryStore
 from adevx.providers.router import ProviderRouter
@@ -60,7 +61,7 @@ class ProviderChatCapability:
                 "No model is currently reachable for this request.\n"
                 "Configure provider keys (OPENAI_API_KEY / OPENROUTER_API_KEY / GROQ_API_KEY / TOGETHER_API_KEY) "
                 "or run local Ollama (ADEVX_ENABLE_OLLAMA=1).\n"
-                f"Provider error: {exc}"
+                f"Provider error: {redact_secrets(exc)}"
             )
 
 

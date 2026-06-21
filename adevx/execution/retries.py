@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import TypeVar
 
 T = TypeVar("T")
@@ -16,6 +17,7 @@ class RetryPolicy:
     base_delay_s: float = 0.5
     max_delay_s: float = 4.0
     jitter_ratio: float = 0.2
+    retry_if: Callable[[Exception], bool] | None = None
 
     def delay_for_attempt(self, attempt: int) -> float:
         raw = min(self.max_delay_s, self.base_delay_s * (2 ** max(0, attempt - 1)))
@@ -30,10 +32,11 @@ async def run_with_retry(coro_factory, policy: RetryPolicy) -> T:
             return await coro_factory()
         except Exception as exc:
             last_error = exc
+            if policy.retry_if is not None and not policy.retry_if(exc):
+                break
             if attempt >= policy.max_attempts:
                 break
             await asyncio.sleep(policy.delay_for_attempt(attempt))
     if last_error is not None:
         raise last_error
     raise RuntimeError("Retry failed with no captured error.")
-

@@ -84,11 +84,13 @@ class JsonMemoryStore:
             for session_id, records in self._data.items()
         }
         serializable["__meta"] = self._meta
-        await asyncio.to_thread(
-            self.path.write_text,
-            json.dumps(serializable, indent=2),
-            "utf-8",
-        )
+        await asyncio.to_thread(self._write_atomic, serializable)
+
+    def _write_atomic(self, data: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
 
     async def add(self, session_id: str, text: str, metadata: dict | None = None) -> None:
         note = text.strip()

@@ -425,3 +425,30 @@ Core event types already used:
 3. Add streaming event types and GUI-ready event consumers.
 4. Add persistent agent/session store.
 5. Add policy-driven permission model for plugin and tool scopes.
+
+## 21. Production Hardening Update - June 21, 2026
+
+This pass strengthened production readiness without changing public commands, provider configuration, RAG behavior, or memory formats.
+
+Implemented hardening:
+
+1. Centralized secret redaction for provider and CLI errors.
+2. Private/local URL fetch blocking by default.
+3. Expanded dangerous shell command blocking.
+4. Atomic local JSON writes for memory/progress stores.
+5. Provider retry filtering for permanent failures.
+6. Circuit-open handling that avoids unnecessary failure amplification.
+7. Bounded `/agent execute` runtime through `ADEVX_AGENT_TIMEOUT`.
+8. Bounded retrieval query cache with index-change invalidation.
+
+Architecture principle:
+
+The stable CLI remains compatible, while production behaviors are pushed into shared helpers where possible. This keeps AdevX usable today and still moves it toward the modular runtime target.
+
+Remaining architecture priorities:
+
+1. Persistent job queue for resumable agent execution.
+2. Unified command bus shared by `taskbot.py` and `adevx.ui.cli`.
+3. Persistent observability and audit log.
+4. Encrypted local secret storage.
+5. RAG quality evaluation fixtures.

@@ -75,6 +75,8 @@ class WorkspaceIndexAdapter:
             os.environ.get("ADEVX_ADVANCED_RETRIEVAL", "1").strip().lower()
             not in {"0", "false", "no", "off"}
         )
+        self._query_cache: dict[tuple[str, int, int, int, bool], str] = {}
+        self._query_cache_limit = int(os.environ.get("ADEVX_RAG_QUERY_CACHE_SIZE", "64"))
         self._last_refresh_ts = 0.0
 
         self._skip_dirs = {
@@ -200,6 +202,7 @@ class WorkspaceIndexAdapter:
     async def set_enabled(self, enabled: bool) -> None:
         async with self._lock:
             self._data["enabled"] = bool(enabled)
+            self._query_cache.clear()
             await asyncio.to_thread(self._save)
 
     async def rebuild(self, chunk_lines: int = 80, overlap_lines: int = 20) -> str:
@@ -805,6 +808,7 @@ class WorkspaceIndexAdapter:
         self._recompute_stats()
         self._data["built_at"] = int(time.time())
         self._save()
+        self._query_cache.clear()
         self._last_refresh_ts = time.time()
         return (
             f"Incremental semantic index rebuilt: {files_indexed} files, "
@@ -865,6 +869,7 @@ class WorkspaceIndexAdapter:
         if not int(self._data.get("built_at", 0) or 0):
             self._data["built_at"] = int(time.time())
         self._save()
+        self._query_cache.clear()
         self._last_refresh_ts = time.time()
         return (
             f"Incremental update applied: changed/new files={len(changed_or_new)}, "
@@ -1123,12 +1128,23 @@ class WorkspaceIndexAdapter:
         if not question:
             return ""
         self._ensure_index_ready()
+        cache_key = (
+            question.lower(),
+            max(1, top_k),
+            max_chars,
+            int(self._data.get("updated_at", 0) or 0),
+            self._advanced_retrieval,
+        )
+        cached = self._query_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         if self._advanced_retrieval:
             hits = self._advanced_query(question, top_k=max(1, top_k))
         else:
             hits = self._basic_hybrid_query(question, top_k=max(1, top_k))
         if not hits:
+            self._remember_query_cache(cache_key, "")
             return ""
 
         query_terms = set(self._expand_query_terms(question))
@@ -1161,7 +1177,15 @@ class WorkspaceIndexAdapter:
             total += len(snippet)
             if total >= max_chars:
                 break
-        return "\n\n".join(parts)
+        rendered = "\n\n".join(parts)
+        self._remember_query_cache(cache_key, rendered)
+        return rendered
+
+    def _remember_query_cache(self, key: tuple[str, int, int, int, bool], value: str) -> None:
+        self._query_cache[key] = value
+        if len(self._query_cache) > self._query_cache_limit:
+            first_key = next(iter(self._query_cache))
+            self._query_cache.pop(first_key, None)
 
     def _repo_snapshot_sync(self) -> dict[str, Any]:
         self._ensure_index_ready()

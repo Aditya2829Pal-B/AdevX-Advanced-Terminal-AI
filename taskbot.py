@@ -23,18 +23,22 @@ import math
 import operator
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Callable
 
 from adevx.core.git_intelligence import GitIntelligence
+from adevx.core.redaction import redact_secrets
 from adevx.rag.index import WorkspaceIndexAdapter
 from adevx.telemetry.benchmarks import BenchmarkRunner
 
@@ -265,7 +269,33 @@ def model_aliases(model_name: str) -> set[str]:
 
 
 def run_async(coro: Any) -> Any:
-    return asyncio.run(coro)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # pragma: no cover - defensive nested-loop path
+            error["exc"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "exc" in error:
+        raise error["exc"]
+    return result.get("value")
+
+
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 class MemoryStore:
@@ -322,7 +352,7 @@ class MemoryStore:
             self._data = {"notes": [], "records": [], "project_memory": {}, "summaries": []}
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        write_json_atomic(self.path, self._data)
 
     def add_note(self, note: str) -> None:
         note = note.strip()
@@ -630,7 +660,7 @@ class ProjectRAGStore:
             pass
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        write_json_atomic(self.path, self._data)
 
     @property
     def enabled(self) -> bool:
@@ -839,7 +869,7 @@ class PhaseProgressStore:
             pass
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        write_json_atomic(self.path, self._data)
 
     def update(self, phase: str, steps: list[dict[str, Any]], benchmark: dict[str, Any]) -> None:
         self._data["last_run_at"] = int(time.time())
@@ -1087,15 +1117,32 @@ def tool_search_text(query: str, path: str = ".", file_glob: str = "*") -> str:
         raise ToolError(f"Path not found: {target}")
     if not target.is_dir():
         raise ToolError(f"Not a directory: {target}")
+    if not query.strip():
+        raise ToolError("Search query cannot be empty.")
 
     pattern = re.compile(re.escape(query), flags=re.IGNORECASE)
     matches: list[str] = []
     max_matches = 120
+    skip_dirs = {
+        ".git",
+        ".adevx_test_tmp",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".pytest_cache",
+        ".mypy_cache",
+    }
+    max_search_chars = int(os.environ.get("ADEVX_SEARCH_MAX_FILE_CHARS", "524288"))
 
     for file_path in target.rglob(file_glob):
         if not file_path.is_file():
             continue
+        if any(part in skip_dirs for part in file_path.relative_to(WORKSPACE_ROOT).parts):
+            continue
         try:
+            if file_path.stat().st_size > max_search_chars:
+                continue
             text = file_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
@@ -1200,12 +1247,52 @@ def tool_calculate(expression: str) -> str:
     return f"{value}"
 
 
-def tool_fetch_url(url: str) -> str:
-    if not url.startswith(("http://", "https://")):
+def _private_url_fetch_allowed() -> bool:
+    return os.environ.get("ADEVX_ALLOW_PRIVATE_URL_FETCH", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _validate_fetch_url(url: str) -> str:
+    raw = url.strip()
+    if len(raw) > 2048:
+        raise ToolError("URL is too long.")
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in {"http", "https"}:
         raise ToolError("URL must start with http:// or https://")
+    if not parsed.hostname:
+        raise ToolError("URL must include a hostname.")
+    if parsed.username or parsed.password:
+        raise ToolError("URL credentials are not allowed.")
+    if _private_url_fetch_allowed():
+        return raw
+
+    host = parsed.hostname.strip().lower()
+    if host in {"localhost"} or host.endswith(".localhost"):
+        raise ToolError("Private/local URL fetch is disabled by default.")
+    try:
+        addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as exc:
+        raise ToolError(f"Could not resolve URL hostname: {exc}") from exc
+    for info in addresses:
+        addr = info[4][0]
+        try:
+            ip = ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            raise ToolError("Private/local URL fetch is disabled by default.")
+    return raw
+
+
+def tool_fetch_url(url: str) -> str:
+    safe_url = _validate_fetch_url(url)
 
     req = urllib.request.Request(
-        url,
+        safe_url,
         headers={"User-Agent": "AdevX/1.0 (+https://example.local)"},
     )
     try:
@@ -1228,8 +1315,24 @@ def tool_run_shell(
     timeout_seconds: int = 30,
     approval_callback: Callable[[str], bool] | None = None,
 ) -> str:
-    if not command.strip():
+    command = command.strip()
+    if not command:
         raise ToolError("Command cannot be empty.")
+    lower = command.lower()
+    blocked_patterns = (
+        "rm -rf",
+        "git reset --hard",
+        "format c:",
+        "del /f /s",
+        "remove-item -recurse",
+        "rd /s",
+        "rmdir /s",
+        ":(){:|:&};:",
+    )
+    for pattern in blocked_patterns:
+        if pattern in lower:
+            raise ToolError(f"Blocked dangerous command pattern: {pattern}")
+    timeout_seconds = max(1, min(int(timeout_seconds), 300))
 
     if approval_callback is not None and not approval_callback(command):
         return "Shell command canceled by user."
@@ -1834,14 +1937,16 @@ class OnlineChatClient:
             prefix = f"{self.provider} API HTTP error {exc.code}"
             if code:
                 prefix += f" ({code})"
-            raise RuntimeError(f"{prefix}: {message}") from exc
+            raise RuntimeError(redact_secrets(f"{prefix}: {message}")) from exc
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", "")
             if str(reason).lower().strip() == "timed out" or "timed out" in str(exc).lower():
                 raise RuntimeError(
                     f"{self.provider} API timed out after {self.request_timeout_s:.0f}s"
                 ) from exc
-            raise RuntimeError(f"{self.provider} API request failed: {exc}") from exc
+            raise RuntimeError(redact_secrets(f"{self.provider} API request failed: {exc}")) from exc
+        except ValueError as exc:
+            raise RuntimeError(redact_secrets(f"{self.provider} API request failed: {exc}")) from exc
 
     def ask(self, user_text: str) -> str:
         self.history.append({"role": "user", "content": user_text})
@@ -2101,7 +2206,7 @@ class MultiProviderOnlineBot:
             except urllib.error.HTTPError as exc:
                 latency_ms = (time.time() - started) * 1000.0
                 body = exc.read().decode("utf-8", errors="replace")
-                short = body.strip().replace("\n", " ")
+                short = redact_secrets(body.strip().replace("\n", " "))
                 if len(short) > 120:
                     short = short[:120] + "..."
                 lines.append(
@@ -2109,7 +2214,7 @@ class MultiProviderOnlineBot:
                 )
             except Exception as exc:
                 latency_ms = (time.time() - started) * 1000.0
-                lines.append(f"- {provider}: FAIL ({latency_ms:.0f} ms) {exc}")
+                lines.append(f"- {provider}: FAIL ({latency_ms:.0f} ms) {redact_secrets(exc)}")
         lines.append(f"Healthy providers: {ok_count}/{len(self.configs)}")
         return "\n".join(lines)
 
@@ -2332,11 +2437,11 @@ class MultiProviderOnlineBot:
                 self.last_errors = []
                 return reply
             except RuntimeError as exc:
-                errors.append(f"{client.provider}: {exc}")
+                errors.append(f"{client.provider}: {redact_secrets(exc)}")
                 continue
 
         self.last_errors = errors
-        raise RuntimeError("All providers failed.\n" + "\n".join(f"- {e}" for e in errors))
+        raise RuntimeError(redact_secrets("All providers failed.\n" + "\n".join(f"- {e}" for e in errors)))
 
 
 class FallbackBot:
@@ -3054,8 +3159,23 @@ class AdevXBot:
                 return "Usage: /agent execute <goal>"
             runtime = self._build_runtime()
             request = UserRequest(text=goal, mode=self.current_mode, session_id="cli-agent")
-            response = run_async(runtime.context.autonomous_engine.run(request))
-            return response.text
+            timeout_s = float(os.environ.get("ADEVX_AGENT_TIMEOUT", "120"))
+
+            async def _execute_with_timeout() -> Any:
+                return await asyncio.wait_for(
+                    runtime.context.autonomous_engine.run(request),
+                    timeout=max(5.0, timeout_s),
+                )
+
+            try:
+                response = run_async(_execute_with_timeout())
+                return response.text
+            except TimeoutError:
+                return (
+                    f"Agent execution timed out after {timeout_s:.0f}s. "
+                    "The task was stopped before it could loop indefinitely. "
+                    "Try a smaller goal or increase ADEVX_AGENT_TIMEOUT."
+                )
         if sub.lower().startswith("review "):
             text = sub[7:].strip()
             if not text:
@@ -3358,7 +3478,7 @@ class AdevXBot:
             try:
                 return self.online_bot.ask(text)
             except RuntimeError as exc:
-                message = str(exc)
+                message = redact_secrets(exc)
                 lowered = message.lower()
                 if (
                     "insufficient_quota" in lowered

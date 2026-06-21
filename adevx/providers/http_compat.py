@@ -14,6 +14,7 @@ from typing import Any
 
 from adevx.core.errors import ProviderError
 from adevx.core.models import AssistantResponse, ChatMessage, UserRequest
+from adevx.core.redaction import redact_secrets
 from adevx.providers.base import BaseProvider
 
 
@@ -123,14 +124,16 @@ class OpenAICompatHTTPProvider(BaseProvider):
             prefix = f"{self.name} API HTTP error {exc.code}"
             if code:
                 prefix += f" ({code})"
-            raise ProviderError(f"{prefix}: {message}") from exc
+            raise ProviderError(redact_secrets(f"{prefix}: {message}")) from exc
         except urllib.error.URLError as exc:
             reason = str(getattr(exc, "reason", "")).strip().lower()
             if reason == "timed out" or "timed out" in str(exc).lower():
                 raise ProviderError(
                     f"{self.name} request timed out after {self.request_timeout_s:.0f}s"
                 ) from exc
-            raise ProviderError(f"{self.name} API request failed: {exc}") from exc
+            raise ProviderError(redact_secrets(f"{self.name} API request failed: {exc}")) from exc
+        except ValueError as exc:
+            raise ProviderError(redact_secrets(f"{self.name} API request failed: {exc}")) from exc
         except json.JSONDecodeError as exc:
             raise ProviderError(f"{self.name} API returned invalid JSON.") from exc
 
@@ -156,4 +159,3 @@ class OpenAICompatHTTPProvider(BaseProvider):
         if not isinstance(first, dict):
             return ""
         return str(first.get("finish_reason", "") or "")
-

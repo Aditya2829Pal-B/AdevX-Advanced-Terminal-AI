@@ -22,6 +22,13 @@ It includes:
 - Git intelligence: repository analysis, commit summaries, and impact reports
 - Memory architecture: stats, search, and consolidation over local memory
 - Local benchmark + metrics commands for retrieval and command health
+- Production hardening:
+  - provider error secret redaction
+  - private/local URL fetch blocking by default
+  - safer shell command blocking
+  - atomic local JSON writes
+  - smarter provider retry/failover behavior
+  - bounded agent execution timeout
 - Built-in tools for:
   - file listing/reading/writing/appending/searching
   - safe math calculation
@@ -217,6 +224,23 @@ For slow local models, increase local timeout:
 ```powershell
 $env:ADEVX_OLLAMA_TIMEOUT="240"
 ```
+
+For long autonomous tasks, tune the agent timeout:
+
+```powershell
+$env:ADEVX_AGENT_TIMEOUT="180"
+```
+
+Private/local URL fetches are blocked by default for safety. Enable only when you trust the target:
+
+```powershell
+$env:ADEVX_ALLOW_PRIVATE_URL_FETCH="1"
+```
+
+## Production Reports
+
+- `docs/PRODUCTION_AUDIT.md`
+- `docs/PRODUCTION_READINESS_REPORT.md`
 
 ## Tests
 
