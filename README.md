@@ -97,12 +97,20 @@ ollama pull qwen2.5:7b
 python taskbot.py --provider ollama-local --model qwen2.5:7b
 ```
 
+For demos without API credits, you can also let AdevX auto-detect Ollama:
+
+```powershell
+ollama pull qwen2.5:7b
+python taskbot.py
+/local
+```
+
 ## Smart Routing + Fallback
 
-- Default chain: `openai -> groq -> openrouter -> together`
-- Add local LLM fallback to chain manually if you want:
-  - `openai,groq,openrouter,together,ollama-local`
+- Default chain: `openai -> groq -> openrouter -> together -> ollama-local`
 - If one provider fails, AdevX automatically tries the next provider.
+- If cloud credits/rate limits fail, AdevX tries an installed Ollama model before showing raw RAG context.
+- Raw RAG snippets are only shown when no cloud provider or local model is available.
 - Configure chain:
 
 ```powershell
@@ -131,6 +139,8 @@ Slash commands always work (even while online):
 - `/autotune [max_latency_seconds]`
 - `/speed fast|balanced|quality`
 - `/health [timeout_seconds]`
+- `/local`
+- `/ollama status|models`
 - `/modes`
 - `/mode <name>`
 - `/image <path>`
@@ -173,6 +183,9 @@ Model switch examples:
 - `/use groq:llama-3.1-8b-instant`
 - `/use openrouter:openrouter/free`
 - `/use ollama-local:qwen2.5:7b`
+- `/local`
+- `/ollama status`
+- `/ollama models`
 - `/autotune 15`
 - `/speed fast`
 - `/mode coding`
@@ -223,6 +236,12 @@ For slow local models, increase local timeout:
 
 ```powershell
 $env:ADEVX_OLLAMA_TIMEOUT="240"
+```
+
+For longer local code answers:
+
+```powershell
+$env:ADEVX_OLLAMA_MAX_TOKENS="1200"
 ```
 
 For long autonomous tasks, tune the agent timeout:

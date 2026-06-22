@@ -107,6 +107,21 @@ FREE_MODEL_CATALOG: dict[str, list[str]] = {
     ],
 }
 
+OLLAMA_LOCAL_MODEL_PRIORITY = [
+    "qwen2.5-coder:7b",
+    "qwen2.5:7b",
+    "llama3.1:8b",
+    "llama3:8b",
+    "mistral:7b",
+    "deepseek-coder:6.7b",
+    "deepseek-r1:7b",
+    "qwen3:8b",
+    "gpt-oss:20b",
+    "qwen3:30b",
+    "deepseek-coder:33b",
+    "llama3.1:70b",
+]
+
 MODE_CATALOG: dict[str, dict[str, str]] = {
     "chat": {
         "summary": "General conversation, Q&A, and everyday tasks.",
@@ -186,6 +201,13 @@ BASE_DEVELOPER_PROMPT = (
     "IMPROVE. If uncertain, state uncertainty clearly."
 )
 
+LOCAL_GENERATION_PROMPT = (
+    "Offline local generation mode is active. Answer the user directly using "
+    "the local model. If project RAG context is present, use it only when it "
+    "helps; do not paste raw README/source chunks as the final answer. For "
+    "coding requests, generate complete working code with a short explanation."
+)
+
 
 def normalize_mode_name(mode: str) -> str | None:
     key = re.sub(r"\s+", " ", mode.strip().lower())
@@ -254,6 +276,84 @@ def ollama_api_root(api_base: str) -> str:
     if base.endswith("/v1"):
         return base[: -len("/v1")]
     return base
+
+
+def ollama_compat_api_base(api_base: str | None = None) -> str:
+    raw = (api_base or os.environ.get("ADEVX_OLLAMA_BASE") or "http://localhost:11434/v1").strip()
+    if not raw:
+        raw = "http://localhost:11434/v1"
+    return f"{ollama_api_root(raw)}/v1"
+
+
+def ollama_detection_timeout_s() -> float:
+    raw = os.environ.get("ADEVX_OLLAMA_DETECT_TIMEOUT", "1.0").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1.0
+    return max(0.25, min(15.0, value))
+
+
+def list_ollama_models(
+    api_base: str | None = None,
+    timeout_s: float | None = None,
+) -> list[dict[str, Any]]:
+    api_base = ollama_compat_api_base(api_base)
+    api_root = ollama_api_root(api_base)
+    timeout = ollama_detection_timeout_s() if timeout_s is None else timeout_s
+    req = urllib.request.Request(f"{api_root}/api/tags", method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    models = data.get("models", [])
+    return models if isinstance(models, list) else []
+
+
+def ollama_model_names(models_data: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for item in models_data:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def pick_ollama_model(models_data: list[dict[str, Any]]) -> str | None:
+    names = ollama_model_names(models_data)
+    if not names:
+        return None
+
+    aliases: dict[str, str] = {}
+    for name in names:
+        for alias in model_aliases(name):
+            aliases[alias.lower()] = name
+
+    for preferred in OLLAMA_LOCAL_MODEL_PRIORITY:
+        for alias in model_aliases(preferred):
+            match = aliases.get(alias.lower())
+            if match:
+                return match
+
+    scored: list[tuple[float, str]] = []
+    for item in models_data:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "").strip()
+        if not name:
+            continue
+        details = item.get("details", {})
+        param_b = 0.0
+        if isinstance(details, dict):
+            param_b = parse_parameter_size_to_billions(str(details.get("parameter_size", "")))
+        # Prefer models that fit common 16GB laptops, but still use larger
+        # installed models when they are the only local option.
+        fit_score = param_b if 0.0 < param_b <= 20.0 else 0.1
+        scored.append((fit_score, name))
+    if scored:
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1]
+    return names[0]
 
 
 def model_aliases(model_name: str) -> set[str]:
@@ -1427,7 +1527,7 @@ def _provider_chain_from_env(provider_pref: str) -> list[str]:
 
     raw = os.environ.get(
         "ADEVX_PROVIDER_CHAIN",
-        "openai,groq,openrouter,together",
+        "openai,groq,openrouter,together,ollama-local",
     )
     names: list[str] = []
     for token in raw.split(","):
@@ -1552,17 +1652,26 @@ def _build_provider_config(
         enabled = os.environ.get("ADEVX_ENABLE_OLLAMA", "1").strip().lower()
         if enabled in {"0", "false", "no"}:
             return None
+        api_base = ollama_compat_api_base(
+            _pick_nonempty(
+                api_base_override,
+                os.environ.get("ADEVX_OLLAMA_BASE"),
+                default="http://localhost:11434/v1",
+            )
+        )
         model = _pick_nonempty(
             model_override,
             os.environ.get("ADEVX_OLLAMA_MODEL"),
             os.environ.get("ADEVX_MODEL"),
-            default="qwen2.5:7b",
+            default="",
         )
-        api_base = _pick_nonempty(
-            api_base_override,
-            os.environ.get("ADEVX_OLLAMA_BASE"),
-            default="http://localhost:11434/v1",
-        )
+        if not model:
+            try:
+                model = pick_ollama_model(list_ollama_models(api_base))
+            except Exception:
+                model = None
+        if not model:
+            return None
         # Ollama ignores API key for compatibility mode.
         ollama_key = _clean_env_secret(os.environ.get("ADEVX_OLLAMA_API_KEY")) or "ollama"
         return ProviderConfig(
@@ -1820,7 +1929,7 @@ class OnlineChatClient:
         self.rag_store = rag_store
         if self.provider == "ollama-local":
             self.request_timeout_s = float(os.environ.get("ADEVX_OLLAMA_TIMEOUT", "180"))
-            self.max_tokens = int(os.environ.get("ADEVX_OLLAMA_MAX_TOKENS", "220"))
+            self.max_tokens = int(os.environ.get("ADEVX_OLLAMA_MAX_TOKENS", "700"))
             self.max_history_messages = int(os.environ.get("ADEVX_OLLAMA_HISTORY", "10"))
         else:
             self.request_timeout_s = float(os.environ.get("ADEVX_REQUEST_TIMEOUT", "45"))
@@ -1853,13 +1962,13 @@ class OnlineChatClient:
         self.speed_profile = profile
         if self.provider == "ollama-local":
             if profile == "fast":
-                self.max_tokens = 140
+                self.max_tokens = 320
                 self.max_history_messages = 8
             elif profile == "balanced":
-                self.max_tokens = 220
+                self.max_tokens = 700
                 self.max_history_messages = 10
             else:
-                self.max_tokens = 420
+                self.max_tokens = 1200
                 self.max_history_messages = 18
         else:
             if profile == "fast":
@@ -1957,6 +2066,8 @@ class OnlineChatClient:
             mode_instruction = mode_instruction_text(self.mode)
             if mode_instruction:
                 messages_for_call.insert(1, {"role": "developer", "content": mode_instruction})
+            if self.provider == "ollama-local":
+                messages_for_call.insert(1, {"role": "developer", "content": LOCAL_GENERATION_PROMPT})
             if self.memory_store is not None:
                 memory_context = self.memory_store.formatted_context(limit=10)
                 if memory_context:
@@ -2123,7 +2234,7 @@ class MultiProviderOnlineBot:
 
     def _preferred_provider_order(self, task_type: str) -> list[str]:
         defaults = {
-            "coding": "ollama-local,groq,openai,openrouter,together",
+            "coding": "openai,groq,openrouter,together,ollama-local",
             "math": "openai,groq,openrouter,together,ollama-local",
             "general": "openrouter,groq,openai,together,ollama-local",
         }
@@ -2474,6 +2585,7 @@ class FallbackBot:
         self.rag_store = rag_store or ProjectRAGStore()
         self.repo_index = WorkspaceIndexAdapter(workspace_root=WORKSPACE_ROOT)
         self.current_mode = "chat"
+        self.local_llm_last_error = ""
         local_configs = _resolve_provider_configs(provider_override="ollama-local")
         self.local_llm: OnlineChatClient | None = None
         if local_configs:
@@ -2484,6 +2596,125 @@ class FallbackBot:
                 rag_store=self.rag_store,
             )
             self.local_llm.set_mode(self.current_mode)
+
+    def _create_local_llm(self, force_refresh: bool = False) -> tuple[OnlineChatClient | None, str]:
+        if self.local_llm is not None and not force_refresh:
+            return self.local_llm, f"ollama-local:{self.local_llm.model}"
+
+        local_configs = _resolve_provider_configs(provider_override="ollama-local")
+        if not local_configs:
+            return (
+                None,
+                "Ollama is not reachable or has no installed models. Run `ollama pull qwen2.5:7b`.",
+            )
+        client = OnlineChatClient(
+            config=local_configs[0],
+            tool_registry=self.tools,
+            memory_store=self.memory_store,
+            rag_store=self.rag_store,
+        )
+        client.set_mode(self.current_mode)
+        self.local_llm = client
+        self.local_llm_last_error = ""
+        return client, f"ollama-local:{client.model}"
+
+    def _try_local_generation(self, raw: str) -> tuple[str | None, str]:
+        client, status = self._create_local_llm()
+        if client is None:
+            self.local_llm_last_error = status
+            return None, status
+        try:
+            return client.ask(raw), ""
+        except RuntimeError as exc:
+            first_error = redact_secrets(str(exc))
+            # If Ollama was started after AdevX or the selected model changed,
+            # refresh once and retry with the currently installed best model.
+            self.local_llm = None
+            client, refreshed_status = self._create_local_llm(force_refresh=True)
+            if client is not None:
+                try:
+                    return client.ask(raw), ""
+                except RuntimeError as retry_exc:
+                    first_error = f"{first_error}; retry via {refreshed_status} failed: {retry_exc}"
+            self.local_llm_last_error = redact_secrets(first_error)
+            return None, self.local_llm_last_error
+
+    def enable_local_mode(self) -> str:
+        client, status = self._create_local_llm(force_refresh=True)
+        if client is None:
+            return (
+                "Local Ollama generation is not available yet.\n"
+                f"Reason: {status}\n"
+                "Install/start Ollama, then run:\n"
+                "- ollama pull qwen2.5:7b\n"
+                "- /local"
+            )
+        return (
+            f"Local Ollama generation enabled with {status}.\n"
+            "Normal prompts now use the local model with memory + RAG context injection."
+        )
+
+    def ollama_status_text(self) -> str:
+        api_base = ollama_compat_api_base()
+        api_root = ollama_api_root(api_base)
+        lines = ["Ollama status:"]
+        lines.append(f"- API: {api_root}")
+        try:
+            models_data = list_ollama_models(api_base)
+        except Exception as exc:
+            self.local_llm = None
+            return "\n".join(
+                [
+                    *lines,
+                    f"- reachable: no ({redact_secrets(exc)})",
+                    "- local generation: unavailable",
+                    "- fix: start Ollama and run `ollama pull qwen2.5:7b`",
+                ]
+            )
+
+        names = ollama_model_names(models_data)
+        picked = pick_ollama_model(models_data)
+        active = self.local_llm.model if self.local_llm is not None else picked
+        lines.append("- reachable: yes")
+        lines.append(f"- models installed: {len(names)}")
+        lines.append(f"- selected model: {active or '<none>'}")
+        if self.local_llm_last_error:
+            lines.append(f"- last local error: {self.local_llm_last_error}")
+        if not names:
+            lines.append("- fix: run `ollama pull qwen2.5:7b`")
+        else:
+            preview = ", ".join(names[:8])
+            if len(names) > 8:
+                preview += ", ..."
+            lines.append(f"- available: {preview}")
+            lines.append("- use: /local or /use ollama-local:<model>")
+        return "\n".join(lines)
+
+    def ollama_models_text(self) -> str:
+        api_base = ollama_compat_api_base()
+        try:
+            models_data = list_ollama_models(api_base)
+        except Exception as exc:
+            return (
+                "Cannot reach Ollama. Start Ollama first, then retry /ollama models.\n"
+                f"Details: {redact_secrets(exc)}"
+            )
+        names = ollama_model_names(models_data)
+        if not names:
+            return (
+                "No Ollama models installed.\n"
+                "Recommended for your laptop/demo:\n"
+                "- ollama pull qwen2.5:7b\n"
+                "- ollama pull qwen2.5-coder:7b\n"
+                "- ollama pull mistral:7b"
+            )
+        lines = ["Installed Ollama models:"]
+        for name in names:
+            selected = " (recommended)" if name == pick_ollama_model(models_data) else ""
+            lines.append(f"- {name}{selected}")
+        lines.append("Switch with: /use ollama-local:<model>")
+        lines.append("Force offline local generation with: /local")
+        return "\n".join(lines)
 
     def set_mode(self, mode: str) -> str:
         normalized = normalize_mode_name(mode)
@@ -2525,14 +2756,12 @@ class FallbackBot:
             subject = normalize_fact_key(who_match.group(1))
             if subject in LOCAL_FACTS:
                 return LOCAL_FACTS[subject]
-            if self.local_llm is not None:
-                try:
-                    return self.local_llm.ask(raw)
-                except RuntimeError:
-                    pass
+            local_answer, _local_error = self._try_local_generation(raw)
+            if local_answer:
+                return local_answer
             return (
                 f"I don't have reliable offline knowledge for '{who_match.group(1).strip()}'. "
-                "Use /online for broader answers, or ask me to run local tasks."
+                "Start Ollama and run /local for broader no-API answers."
             )
         if lower in {"help", "h", "commands", "what can you do"}:
             return self._help()
@@ -2647,19 +2876,19 @@ class FallbackBot:
         except ToolError as exc:
             return f"Tool error: {exc}"
 
-        if self.local_llm is not None:
-            try:
-                return self.local_llm.ask(raw)
-            except RuntimeError:
-                pass
+        local_answer, local_error = self._try_local_generation(raw)
+        if local_answer:
+            return local_answer
 
         if self.rag_store.enabled:
             rag_context = self.rag_store.retrieve_context(raw, top_k=3, max_chars=2200)
             if rag_context:
                 return (
-                    "I found relevant project context from local RAG index:\n\n"
+                    "No local model is available to synthesize an answer, so I can only show "
+                    "raw retrieved project context.\n"
+                    f"Local model status: {local_error or 'unavailable'}\n\n"
                     f"{rag_context}\n\n"
-                    "Tip: for stronger synthesis, run /online with a model enabled."
+                    "Tip: start Ollama and run /local so AdevX generates answers from this context."
                 )
 
         if self.current_mode == "image":
@@ -2701,6 +2930,8 @@ class FallbackBot:
             - /shell <command>
             - /summarize <text>
             - /health [timeout_seconds]
+            - /local
+            - /ollama status|models
             - /about
             - /models
             - /use provider:model
@@ -2740,6 +2971,15 @@ class FallbackBot:
                 return self._help()
             if cmd == "/about":
                 return ABOUT_TEXT
+            if cmd == "/local":
+                return self.enable_local_mode()
+            if cmd == "/ollama":
+                sub = text[len("/ollama") :].strip().lower()
+                if not sub or sub == "status":
+                    return self.ollama_status_text()
+                if sub == "models":
+                    return self.ollama_models_text()
+                return "Usage: /ollama status|models"
             if cmd == "/memory":
                 notes = self.memory_store.notes(limit=30)
                 if not notes:
@@ -2860,6 +3100,11 @@ class AdevXBot:
             f"({self.rag_store._data.get('files_indexed', 0)} files, "
             f"{self.rag_store._data.get('chunks_indexed', 0)} chunks)"
         )
+        local_line = (
+            f"Local LLM: ollama-local:{self.offline_bot.local_llm.model}"
+            if self.offline_bot.local_llm is not None
+            else "Local LLM: auto-detect with /local or /ollama status"
+        )
         last_error_line = (
             f"\nLast online error: {self.last_online_error}" if self.last_online_error else ""
         )
@@ -2869,6 +3114,7 @@ class AdevXBot:
                 f"Mode: {live_mode}\n"
                 f"AdevX mode: {self.current_mode}\n"
                 f"{self.online_bot.status_text()}\n"
+                f"{local_line}\n"
                 f"{rag_line}\n"
                 f"{self.phase_store.status_text()}\n"
                 f"{last_error_line}\n"
@@ -2878,6 +3124,7 @@ class AdevXBot:
             "Mode: offline (local minimal reasoning)\n"
             f"AdevX mode: {self.current_mode}\n"
             "Local engine: rule-based + optional Ollama local LLM (no cloud token billing)\n"
+            f"{local_line}\n"
             f"{rag_line}\n"
             f"{self.phase_store.status_text()}\n"
             f"{last_error_line}\n"
@@ -3291,6 +3538,19 @@ class AdevXBot:
         if lower == "/metrics":
             return self._run_tracked_command("metrics", self._handle_metrics_command)
 
+        if lower == "/local":
+            self.use_online = False
+            return self._run_tracked_command("local", self.offline_bot.enable_local_mode)
+
+        if lower == "/ollama" or lower == "/ollama status":
+            return self._run_tracked_command("ollama", self.offline_bot.ollama_status_text)
+
+        if lower == "/ollama models":
+            return self._run_tracked_command("ollama", self.offline_bot.ollama_models_text)
+
+        if lower.startswith("/ollama "):
+            return "Usage: /ollama status|models"
+
         if lower == "/modes":
             return modes_text()
 
@@ -3458,7 +3718,7 @@ class AdevXBot:
             return self._status_text()
         if lower == "/offline":
             self.use_online = False
-            return "Switched to offline mode. Use /help for commands."
+            return "Switched to offline mode. Use /local to enable Ollama generation, or /help for commands."
         if lower == "/online":
             if not self.online_bot:
                 return (
@@ -3489,8 +3749,9 @@ class AdevXBot:
                     self.use_online = False
                     self.last_online_error = message
                     return (
-                        "Online quota/rate limit reached. I switched to offline mode.\n"
-                        "Use /status to see provider state, then /online after credits/reset.\n\n"
+                        "Online quota/rate limit reached. I switched to offline/local mode "
+                        "and will try Ollama before raw RAG.\n"
+                        "Use /ollama status or /local for local model details.\n\n"
                         f"{self.offline_bot.ask(text)}"
                     )
                 if "invalid header value" in lowered:
@@ -3498,7 +3759,7 @@ class AdevXBot:
                     self.last_online_error = message
                     return (
                         "Your API key looks malformed (often hidden newline/space). "
-                        "I switched to offline mode.\n\n"
+                        "I switched to offline/local mode and will try Ollama.\n\n"
                         f"{self.offline_bot.ask(text)}"
                     )
                 if "timed out" in lowered and "ollama-local" in lowered:
@@ -3513,7 +3774,7 @@ class AdevXBot:
                     self.last_online_error = message
                     return (
                         "All online providers are currently unavailable. "
-                        "I switched to offline mode.\n\n"
+                        "I switched to offline/local mode and will try Ollama before raw RAG.\n\n"
                         f"{self.offline_bot.ask(text)}"
                     )
                 self.last_online_error = message
@@ -3636,7 +3897,7 @@ def main(argv: list[str]) -> int:
         f"AdevX mode: {bot.current_mode}\n"
         f"{provider_line}\n"
         f"Workspace: {WORKSPACE_ROOT}\n"
-        "Type /status, /modes, /mode <name>, /online, /offline, or /exit."
+        "Type /status, /local, /ollama status, /modes, /online, /offline, or /exit."
     )
     print(banner)
 
